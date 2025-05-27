@@ -4,6 +4,9 @@ import logging
 from web3 import Web3
 import time
 from colorama import init, Fore, Style
+from datetime import datetime
+import math
+import random
 
 init(autoreset=True)
 
@@ -126,12 +129,158 @@ tx_count = 0
 
 refresh_token = load_refresh_token_from_file()
 
+def get_latest_nonce(web3, address):
+    return web3.eth.get_transaction_count(address, 'pending')
+
+def wait_for_transaction(web3, tx_hash, timeout=120):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        try:
+            receipt = web3.eth.get_transaction_receipt(tx_hash)
+            if receipt is not None:
+                return receipt
+        except Exception:
+            pass
+        time.sleep(1)
+    raise TimeoutError(f"Transaction not mined after {timeout} seconds")
+
+def send_transaction_with_retry(web3, transaction, private_key, max_retries=3):
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            # Reset nonce setiap retry
+            current_nonce = web3.eth.get_transaction_count(web3.eth.account.from_key(private_key).address, 'pending')
+            transaction['nonce'] = current_nonce
+            
+            signed_txn = web3.eth.account.sign_transaction(transaction, private_key=private_key)
+            tx_hash = web3.eth.send_raw_transaction(signed_txn.raw_transaction)
+            
+            # Tunggu konfirmasi dengan timeout yang lebih pendek
+            for _ in range(30):  # 30 detik timeout
+                try:
+                    receipt = web3.eth.get_transaction_receipt(tx_hash)
+                    if receipt is not None:
+                        return receipt
+                except Exception:
+                    pass
+                time.sleep(1)
+            
+            # Jika tidak ada receipt setelah 30 detik, raise exception
+            raise TimeoutError("Transaction stuck: no receipt after 30 seconds")
+            
+        except Exception as e:
+            last_error = e
+            print(Fore.YELLOW + f"\nRetrying transaction (attempt {attempt + 1}/{max_retries})..." + Style.RESET_ALL)
+            time.sleep(2 ** attempt)  # Exponential backoff
+            continue
+    
+    raise Exception(f"Failed after {max_retries} attempts. Last error: {str(last_error)}")
+
+def get_low_priority_gas_fee(web3):
+    try:
+        # Mendapatkan base fee dari block terbaru
+        base_fee = web3.eth.get_block('latest').baseFeePerGas
+        gas_price = web3.eth.gas_price
+        
+        # Menggunakan base fee sebagai minimum dan menambahkan sedikit tip
+        max_fee_per_gas = base_fee + (gas_price // 10)  # base fee + 10% dari gas price sebagai tip
+        
+        return max_fee_per_gas, max_fee_per_gas
+    except Exception as e:
+        # Fallback ke gas price standar jika gagal mendapatkan base fee
+        gas_price = web3.eth.gas_price
+        return gas_price, gas_price
+
+def calculate_transaction_estimate(web3, address, gas_price):
+    balance = web3.eth.get_balance(address)
+    gas_cost = gas_price * 50000  # 50000 adalah gas limit yang kita gunakan
+    transaction_cost = gas_cost + value_in_wei
+    
+    # Estimasi dengan asumsi gas fee bisa naik 2x lipat
+    conservative_cost = transaction_cost * 2
+    
+    # Sisakan 10% saldo untuk jaga-jaga
+    usable_balance = balance * 0.9
+    
+    max_transactions = int(usable_balance / conservative_cost)
+    return balance, max_transactions, gas_cost
+
+def display_transaction_info(web3, address, gas_price):
+    balance, max_tx, gas_cost = calculate_transaction_estimate(web3, address, gas_price)
+    
+    print(Fore.YELLOW + "\n=== Informasi Transaksi ===" + Style.RESET_ALL)
+    print(Fore.CYAN + f"Saldo: {web3.from_wei(balance, 'ether'):.8f} ETH" + Style.RESET_ALL)
+    print(Fore.CYAN + f"Estimasi Gas Fee: {web3.from_wei(gas_cost, 'ether'):.12f} ETH per transaksi" + Style.RESET_ALL)
+    print(Fore.CYAN + f"Estimasi Jumlah Transaksi yang Bisa Dilakukan: {max_tx:,}" + Style.RESET_ALL)
+    
+    # Warning jika saldo sudah rendah
+    if balance < (gas_cost * 10):
+        print(Fore.RED + "⚠️ PERINGATAN: Saldo sangat rendah, hanya cukup untuk < 10 transaksi!" + Style.RESET_ALL)
+    elif balance < (gas_cost * 50):
+        print(Fore.YELLOW + "⚠️ Perhatian: Saldo cukup untuk < 50 transaksi" + Style.RESET_ALL)
+
+def format_time(seconds):
+    if seconds < 60:
+        return f"{seconds:.0f} detik"
+    elif seconds < 3600:
+        minutes = seconds / 60
+        return f"{minutes:.0f} menit"
+    else:
+        hours = seconds / 3600
+        return f"{hours:.1f} jam"
+
+def display_progress(current, total, start_time):
+    now = time.time()
+    elapsed = now - start_time
+    if current > 0:
+        est_total_time = (elapsed / current) * total
+        remaining = est_total_time - elapsed
+        progress = (current / total) * 100
+        
+        print(Fore.CYAN + f"\rProgress: [{current}/{total}] {progress:.1f}% | " +
+              f"Waktu: {format_time(elapsed)} | " +
+              f"Estimasi Selesai: {format_time(remaining)}" + Style.RESET_ALL, end="")
+
+def safety_check(web3, address, num_transactions, gas_price):
+    balance, max_tx, gas_cost = calculate_transaction_estimate(web3, address, gas_price)
+    
+    if num_transactions > 1000:
+        print(Fore.YELLOW + "\n=== Peringatan Transaksi Besar ===" + Style.RESET_ALL)
+        print(Fore.YELLOW + f"Anda akan melakukan {num_transactions:,} transaksi" + Style.RESET_ALL)
+        print(Fore.CYAN + f"Estimasi waktu: {format_time(num_transactions * 1.5)}" + Style.RESET_ALL)
+        
+        if num_transactions > max_tx:
+            print(Fore.RED + f"\n⚠️ PERINGATAN: Saldo tidak cukup untuk {num_transactions:,} transaksi!")
+            print(f"Maksimum transaksi yang bisa dilakukan dengan saldo saat ini: {max_tx:,}" + Style.RESET_ALL)
+            
+        confirm = input(Fore.YELLOW + "\nLanjutkan transaksi? (y/n): " + Style.RESET_ALL)
+        if confirm.lower() != 'y':
+            print(Fore.RED + "Transaksi dibatalkan." + Style.RESET_ALL)
+            exit()
+
+# Tambahkan safety check sebelum memulai transaksi
+safety_check(web3, web3.eth.account.from_key(private_keys[0]).address, num_transactions, web3.eth.gas_price)
+
+start_time = time.time()
+success_count = 0
+error_count = 0
+
 for i in range(num_transactions):
     for private_key in private_keys:
         from_address = web3.eth.account.from_key(private_key).address
         short_from_address = from_address[:4] + "..." + from_address[-4:]
 
         try:
+            # Get fresh nonce setiap transaksi
+            nonces[private_key] = web3.eth.get_transaction_count(from_address, 'pending')
+            
+            max_fee_per_gas, max_priority_fee_per_gas = get_low_priority_gas_fee(web3)
+            
+            if i == 0:
+                display_transaction_info(web3, from_address, max_fee_per_gas)
+                print(Fore.GREEN + "\nMemulai transaksi..." + Style.RESET_ALL)
+            
             access_token_info = refresh_access_token(refresh_token)
             access_token = access_token_info["access_token"]
             refresh_token = access_token_info.get("refresh_token", refresh_token)
@@ -140,39 +289,46 @@ for i in range(num_transactions):
                 'from': from_address,
                 'value': value_in_wei,
                 'gas': 50000,
-                'gasPrice': web3.eth.gas_price,
+                'maxFeePerGas': max_fee_per_gas,
+                'maxPriorityFeePerGas': max_priority_fee_per_gas,
+                'type': 2,
                 'nonce': nonces[private_key],
             })
 
-            signed_txn = web3.eth.account.sign_transaction(transaction, private_key=private_key)
-            tx_hash = web3.eth.send_raw_transaction(signed_txn.raw_transaction)
-            tx_receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
-            tx_hash_hex = tx_receipt['transactionHash'].hex()
-            print(Fore.GREEN + f"Transaction {i + 1} sent from {short_from_address} with hash: {tx_hash_hex}")
-
+            # Kirim transaksi dengan retry
+            receipt = send_transaction_with_retry(web3, transaction, private_key)
+            tx_hash_hex = receipt['transactionHash'].hex()
+            
             if not tx_hash_hex.startswith('0x'):
                 tx_hash_hex = '0x' + tx_hash_hex
 
             validate_tx_hash(tx_hash_hex)
-
-            print(Fore.YELLOW + f"Syncing transaction with hash: {tx_hash_hex}", end='\r')
-
+            
+            # Sync transaksi dengan retry
             sync_response = sync_transaction(tx_hash_hex, chain_id, access_token)
-
+            
             if sync_response.get('data', {}).get('syncEthereumTx'):
-                print(Fore.CYAN + f"Sync {short_from_address} successful with hash: {tx_hash_hex}")
+                success_count += 1
+                display_progress(i + 1, num_transactions, start_time)
             else:
-                print(Fore.RED + "Sync failed!")
-            nonces[private_key] += 1
-            tx_count += 1
+                raise Exception("Sync failed")
 
-            time.sleep(1)
+            # Tambah delay random untuk menghindari rate limiting
+            time.sleep(random.uniform(1.0, 2.0))
 
         except Exception as e:
-            if 'nonce too low' in str(e):
-                print(Fore.RED + f"Nonce too low for {short_from_address}. Fetching the latest nonce...")
-                nonces[private_key] = web3.eth.get_transaction_count(from_address)
-            else:
-                print(Fore.RED + f"Error sending transaction from {short_from_address}: {str(e)}")
+            error_count += 1
+            print(Fore.RED + f"\nError pada transaksi {i + 1}: {str(e)}" + Style.RESET_ALL)
+            
+            if error_count >= 5:
+                print(Fore.RED + "\n⚠️ Terlalu banyak error berturut-turut, menghentikan proses..." + Style.RESET_ALL)
+                break
+            
+            # Tunggu lebih lama jika terjadi error
+            time.sleep(5)
 
-print(Fore.MAGENTA + "Finished sending transactions.")
+total_time = time.time() - start_time
+print(Fore.GREEN + f"\n\nTransaksi selesai!" + Style.RESET_ALL)
+print(Fore.CYAN + f"Total waktu: {format_time(total_time)}")
+print(f"Transaksi berhasil: {success_count}")
+print(f"Transaksi gagal: {error_count}" + Style.RESET_ALL)
