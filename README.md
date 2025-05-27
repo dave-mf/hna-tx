@@ -52,7 +52,7 @@ pip install web3 colorama requests
 
 1. Jalankan script deposit:
 ```bash
-python3 hana.py (Linux)
+python3 hana.py
 ```
 
 2. Pilih jaringan:
