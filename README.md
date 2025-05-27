@@ -18,8 +18,8 @@ Bot otomatis untuk melakukan deposit ETH dan mengelola akun Hanafuda di jaringan
 
 1. Clone repository:
 ```bash
-git clone https://github.com/dpangestuw/HANA.git
-cd HANA
+git clone https://github.com/dave-mf/hna-tx.git
+cd hna-tx
 ```
 
 2. Install dependencies yang diperlukan:
